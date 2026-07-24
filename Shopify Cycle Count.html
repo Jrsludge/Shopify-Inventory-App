@@ -347,10 +347,10 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       screen: 'start', // start | location | summary | counting | report
       productsFileName: null,
       inventoryFileName: null,
-      products: [],          // [{sku, barcode, title, variantLabel, costPerItem, key}]
-      productByKey: {},      // "sku||variant" -> product record (the precise lookup)
+      products: [],          // [{sku, barcode, title, variantLabel, costPerItem}]
+      productsBySku: {},     // sku -> [product record, ...]  (usually one; more when a SKU is shared across variants)
       barcodeToRecord: {},   // barcode -> product record (single owner)
-      barcodeConflicts: {},  // barcode -> [record,...]  (2+ distinct variants sharing a barcode)
+      barcodeConflicts: {},  // barcode -> [record,...]  (2+ distinct SKUs sharing a barcode)
       sharedSkus: [],        // [{sku, variantLabels}] - same SKU legitimately used by >1 variant (e.g. King/Cal King)
       duplicateRowWarnings: [], // [{sku, variantLabel}] - exact same SKU+variant repeated, likely an export glitch
       inventoryByLocation: {}, // location -> { "sku||variant" -> {sku, variantLabel, onHand, notStocked, sourceRow} }
@@ -359,6 +359,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       selectedLocation: null,
       countLines: {},   // "sku||variant" -> {sku, barcode, title, variantLabel, costPerItem, expected, counted, noBarcode, notInProducts, lastUpdated, key}
       extraLines: {},   // "sku||variant" -> same shape, expected forced to 0, foundUnexpected:true
+      skuToCountKeys: {}, // sku -> [countLine key, ...] so a scanned barcode resolves to its expected line(s) by SKU
       scanLog: [],      // {t, input, result, key}
       unrecognizedScans: {}, // rawValue -> count
       startedAt: null,
@@ -512,26 +513,43 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     return [v1, v2, v3].filter(Boolean).join(' / ');
   }
 
-  // Some suppliers only distinguish e.g. King vs Cal King by physical
-  // barcode, not by SKU, so two genuinely different variants can share one
-  // SKU string in Shopify. Every count line is therefore identified by
-  // SKU + variant (not SKU alone), so those variants get separate expected
-  // quantities, separate tallies, and don't clobber each other. The variant
-  // portion is normalized (trim/lowercase) since it's compared across two
-  // different Shopify export types that may format it slightly differently.
+  function normVariant(v) {
+    return (v || '').toLowerCase().trim();
+  }
+
+  // Count lines are keyed by SKU + the INVENTORY file's own variant label, so
+  // that two inventory rows sharing one SKU (e.g. King vs Cal King, when a
+  // supplier only distinguishes them by barcode) stay as separate lines.
+  // NOTE: this key is only ever compared within the inventory file / count —
+  // never against the Products file. The Products file often writes option
+  // values differently (linked metafield options export as lowercase slugs,
+  // e.g. "indigo-chambray" vs the inventory's "Indigo Chambray"), so product
+  // data is matched by SKU, never by this key. See pickProductForSku.
   function lineKey(sku, variantLabel) {
-    return sku + '||' + (variantLabel || '').toLowerCase().trim();
+    return sku + '||' + normVariant(variantLabel);
+  }
+
+  // Choose the Products record for an inventory line. Match on SKU (identical
+  // across both export types); only use the variant label to disambiguate when
+  // one SKU maps to several product variants (a shared SKU). Returns null only
+  // when the SKU genuinely does not appear in the Products file at all.
+  function pickProductForSku(sku, invVariantLabel) {
+    var recs = state.productsBySku[sku];
+    if (!recs || !recs.length) return null;
+    if (recs.length === 1) return recs[0];
+    var norm = normVariant(invVariantLabel);
+    var matched = recs.filter(function (r) { return normVariant(r.variantLabel) === norm; });
+    return matched.length === 1 ? matched[0] : recs[0];
   }
 
   function processProductsRows(rows) {
     var products = [];
-    var productByKey = {};
+    var productsBySku = {};
     var barcodeToRecord = {};
     var barcodeConflicts = {};
     var handleTitle = {};
     var seenKeys = {};
     var duplicateRowWarnings = []; // exact same SKU+variant repeated - likely an export glitch
-    var skuVariantLabels = {}; // sku -> distinct variant labels seen, to spot shared-SKU variants
 
     // forward-fill Title per Handle (Shopify export leaves Title blank on
     // every row after the first for a given product)
@@ -554,24 +572,21 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (seenKeys[key]) duplicateRowWarnings.push({ sku: sku, variantLabel: variantLabel });
       seenKeys[key] = true;
 
-      if (!skuVariantLabels[sku]) skuVariantLabels[sku] = [];
-      if (skuVariantLabels[sku].indexOf(variantLabel) === -1) skuVariantLabels[sku].push(variantLabel);
-
       var record = {
         sku: sku,
         barcode: barcode,
         title: title,
         variantLabel: variantLabel,
-        costPerItem: cost,
-        key: key
+        costPerItem: cost
       };
       products.push(record);
-      productByKey[key] = record;
+      if (!productsBySku[sku]) productsBySku[sku] = [];
+      productsBySku[sku].push(record);
 
       if (barcode && !isUnsafeKey(barcode)) {
         if (barcodeConflicts[barcode]) {
-          if (barcodeConflicts[barcode].every(function (r) { return r.key !== key; })) barcodeConflicts[barcode].push(record);
-        } else if (barcodeToRecord[barcode] && barcodeToRecord[barcode].key !== key) {
+          if (barcodeConflicts[barcode].every(function (r) { return r.sku !== sku || normVariant(r.variantLabel) !== normVariant(variantLabel); })) barcodeConflicts[barcode].push(record);
+        } else if (barcodeToRecord[barcode] && barcodeToRecord[barcode].sku !== sku) {
           barcodeConflicts[barcode] = [barcodeToRecord[barcode], record];
           delete barcodeToRecord[barcode];
         } else {
@@ -580,13 +595,18 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       }
     });
 
-    var sharedSkus = Object.keys(skuVariantLabels)
-      .filter(function (sku) { return skuVariantLabels[sku].length > 1; })
-      .map(function (sku) { return { sku: sku, variantLabels: skuVariantLabels[sku] }; });
+    // A SKU used by more than one distinct variant label (e.g. King/Cal King).
+    var sharedSkus = Object.keys(productsBySku)
+      .map(function (sku) {
+        var labels = [];
+        productsBySku[sku].forEach(function (r) { if (labels.indexOf(r.variantLabel) === -1) labels.push(r.variantLabel); });
+        return { sku: sku, variantLabels: labels };
+      })
+      .filter(function (s) { return s.variantLabels.length > 1; });
 
     return {
       products: products,
-      productByKey: productByKey,
+      productsBySku: productsBySku,
       barcodeToRecord: barcodeToRecord,
       barcodeConflicts: barcodeConflicts,
       sharedSkus: sharedSkus,
@@ -656,7 +676,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     Object.keys(state.inventoryByLocation).forEach(function (loc) {
       var m = state.inventoryByLocation[loc];
       Object.keys(m).forEach(function (key) {
-        if (!m[key].notStocked && !state.productByKey[key]) missing[m[key].sku] = true;
+        var sku = m[key].sku;
+        // "Missing" means the SKU itself is absent from the Products file.
+        // Matching is by SKU, never by variant label — the two exports format
+        // linked-option variant labels differently. See pickProductForSku.
+        if (!m[key].notStocked && !state.productsBySku[sku]) missing[sku] = true;
       });
     });
     return Object.keys(missing).sort();
@@ -670,7 +694,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (err) { toast('Could not read Products CSV: ' + err.message, 'bad'); return; }
       var result = processProductsRows(rows);
       state.products = result.products;
-      state.productByKey = result.productByKey;
+      state.productsBySku = result.productsBySku;
       state.barcodeToRecord = result.barcodeToRecord;
       state.barcodeConflicts = result.barcodeConflicts;
       state.sharedSkus = result.sharedSkus;
@@ -702,19 +726,23 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     state.selectedLocation = location;
     var expected = state.inventoryByLocation[location] || {};
     var countLines = {};
+    var skuToCountKeys = {};
 
     Object.keys(expected).forEach(function (key) {
       var entry = expected[key];
       if (entry.notStocked) return; // not carried at this location at all
-      var product = state.productByKey[key];
-      // Fall back to the Inventory file's own title/variant (not just a
-      // generic placeholder) when this SKU+variant has no Products match.
+      // Match product data by SKU (identical across both exports). Use the
+      // inventory variant label only to disambiguate a shared SKU.
+      var product = pickProductForSku(entry.sku, entry.variantLabel);
+      // Keep the Inventory file's own variant label for display — it's the
+      // human-readable one ("Indigo Chambray"), whereas a linked-option
+      // Products row may only have the slug ("indigo-chambray").
       var fallbackTitle = entry.sourceRow.title || entry.sourceRow.handle || '(unknown product)';
       countLines[key] = {
         sku: entry.sku,
         barcode: product ? product.barcode : '',
         title: product ? product.title : fallbackTitle,
-        variantLabel: product ? product.variantLabel : entry.variantLabel,
+        variantLabel: entry.variantLabel || (product ? product.variantLabel : ''),
         costPerItem: product ? product.costPerItem : null,
         expected: entry.onHand || 0,
         counted: 0,
@@ -724,9 +752,12 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         key: key,
         sourceRow: entry.sourceRow
       };
+      if (!skuToCountKeys[entry.sku]) skuToCountKeys[entry.sku] = [];
+      skuToCountKeys[entry.sku].push(key);
     });
 
     state.countLines = countLines;
+    state.skuToCountKeys = skuToCountKeys;
     state.extraLines = {};
     state.scanLog = [];
     state.unrecognizedScans = {};
@@ -781,17 +812,35 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return;
     }
 
-    var key = record.key;
-    entry.key = key;
-    if (state.countLines[key]) {
+    // Resolve the scanned barcode to a count line by SKU (product and inventory
+    // variant labels are formatted differently, so never key on the label). If
+    // the SKU has several expected lines here (a shared SKU), disambiguate by
+    // matching the scanned variant to the inventory variant.
+    var candidateKeys = state.skuToCountKeys[record.sku] || [];
+    var key = null;
+    if (candidateKeys.length === 1) {
+      key = candidateKeys[0];
+    } else if (candidateKeys.length > 1) {
+      var norm = normVariant(record.variantLabel);
+      var matched = candidateKeys.filter(function (k) { return normVariant(state.countLines[k].variantLabel) === norm; });
+      key = matched.length === 1 ? matched[0] : candidateKeys[0];
+      if (matched.length !== 1) {
+        toast('SKU ' + record.sku + ' has multiple variants at this location and the barcode could not tell them apart — added to the first; verify manually.', 'warn');
+      }
+    }
+
+    if (key) {
       bumpLine(state.countLines, key, 1);
+      entry.key = key;
       entry.result = 'ok';
       var line = state.countLines[key];
       toast((line.title + (line.variantLabel ? ' — ' + line.variantLabel : '')) + '  +1  (now ' + line.counted + ')', 'ok');
     } else {
-      addOrBumpExtra(key, record);
+      var extraKey = lineKey(record.sku, record.variantLabel);
+      addOrBumpExtra(extraKey, record);
+      entry.key = extraKey;
       entry.result = 'extra';
-      var el = state.extraLines[key];
+      var el = state.extraLines[extraKey];
       toast('Not expected at this location! ' + el.title + '  +1  (now ' + el.counted + ') — will show as overage', 'warn');
     }
     state.scanLog.push(entry);
