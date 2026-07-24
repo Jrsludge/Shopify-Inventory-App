@@ -256,7 +256,30 @@
       var onHand = notStocked ? null : parseFloat(raw.replace(/[^0-9.\-]/g, ''));
       if (isNaN(onHand)) { onHand = null; notStocked = true; }
 
-      inventoryByLocation[location][sku] = { onHand: onHand, notStocked: notStocked };
+      // Keep the original row's own fields so a Shopify-importable inventory
+      // file can be regenerated later as a faithful echo of this file, with
+      // only "On hand (new)" filled in from the physical count.
+      inventoryByLocation[location][sku] = {
+        onHand: onHand,
+        notStocked: notStocked,
+        sourceRow: {
+          handle: getVal(row, 'Handle'),
+          title: getVal(row, 'Title'),
+          option1Name: getVal(row, 'Option1 Name'),
+          option1Value: getVal(row, 'Option1 Value'),
+          option2Name: getVal(row, 'Option2 Name'),
+          option2Value: getVal(row, 'Option2 Value'),
+          option3Name: getVal(row, 'Option3 Name'),
+          option3Value: getVal(row, 'Option3 Value'),
+          hsCode: getVal(row, 'HS Code'),
+          coo: getVal(row, 'COO'),
+          binName: getVal(row, 'Bin name'),
+          incoming: getVal(row, 'Incoming (not editable)'),
+          unavailable: getVal(row, 'Unavailable (not editable)'),
+          committed: getVal(row, 'Committed (not editable)'),
+          available: getVal(row, 'Available (not editable)')
+        }
+      };
     });
 
     return {
@@ -330,7 +353,8 @@
         counted: 0,
         noBarcode: !product || !product.barcode,
         notInProducts: !product,
-        lastUpdated: 0
+        lastUpdated: 0,
+        sourceRow: entry.sourceRow
       };
     });
 
@@ -486,6 +510,25 @@
   // ---------------------------------------------------------------------
   // Excel export
   // ---------------------------------------------------------------------
+  var REPORT_ROW_HEADER = ['SKU', 'Title', 'Variant', 'Expected', 'Counted', 'Difference', 'Cost/Item', 'Cost Impact', 'Notes'];
+  var REPORT_COL_WIDTHS = [{ wch: 16 }, { wch: 34 }, { wch: 24 }, { wch: 10 }, { wch: 10 }, { wch: 11 }, { wch: 10 }, { wch: 12 }, { wch: 34 }];
+
+  function reportRowToAoa(r) {
+    var notes = [];
+    if (r.notInProducts) notes.push('Not in Products file');
+    if (r.noBarcode && !r.notInProducts) notes.push('No barcode on file');
+    if (r.foundUnexpected) notes.push('Found at location but not expected here');
+    if (r.costPerItem === null || r.costPerItem === undefined) notes.push('No cost data');
+    return [r.sku, r.title, r.variantLabel, r.expected, r.counted, r.diff,
+      r.costPerItem === null ? null : r.costPerItem, r.costImpact, notes.join('; ')];
+  }
+
+  function exportFilename(suffix) {
+    var dateStr = new Date().toISOString().slice(0, 10);
+    var safeLoc = (state.selectedLocation || 'location').replace(/[^a-z0-9]+/gi, '-');
+    return 'Cycle Count' + (suffix ? ' ' + suffix : '') + ' - ' + safeLoc + ' - ' + dateStr + '.xlsx';
+  }
+
   function exportExcel() {
     var rows = buildReportRows();
     var totals = reportTotals(rows);
@@ -513,30 +556,18 @@
     aoa.push(['Variants matching exactly', totals.matchCount]);
     aoa.push([]);
 
-    var header = ['SKU', 'Title', 'Variant', 'Expected', 'Counted', 'Difference', 'Cost/Item', 'Cost Impact', 'Notes'];
-
-    function rowToAoa(r) {
-      var notes = [];
-      if (r.notInProducts) notes.push('Not in Products file');
-      if (r.noBarcode && !r.notInProducts) notes.push('No barcode on file');
-      if (r.foundUnexpected) notes.push('Found at location but not expected here');
-      if (r.costPerItem === null || r.costPerItem === undefined) notes.push('No cost data');
-      return [r.sku, r.title, r.variantLabel, r.expected, r.counted, r.diff,
-        r.costPerItem === null ? null : r.costPerItem, r.costImpact, notes.join('; ')];
-    }
-
     aoa.push(['DISCREPANCIES (' + discrepancies.length + ')']);
-    aoa.push(header);
-    discrepancies.forEach(function (r) { aoa.push(rowToAoa(r)); });
+    aoa.push(REPORT_ROW_HEADER);
+    discrepancies.forEach(function (r) { aoa.push(reportRowToAoa(r)); });
     aoa.push([]);
     aoa.push(['MATCHES (' + matches.length + ')']);
-    aoa.push(header);
-    matches.forEach(function (r) { aoa.push(rowToAoa(r)); });
+    aoa.push(REPORT_ROW_HEADER);
+    matches.forEach(function (r) { aoa.push(reportRowToAoa(r)); });
 
     var unknown = Object.keys(state.unrecognizedScans);
     var wb = XLSX.utils.book_new();
     var ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 16 }, { wch: 34 }, { wch: 24 }, { wch: 10 }, { wch: 10 }, { wch: 11 }, { wch: 10 }, { wch: 12 }, { wch: 34 }];
+    ws['!cols'] = REPORT_COL_WIDTHS;
     XLSX.utils.book_append_sheet(wb, ws, 'Cycle Count Report');
 
     if (unknown.length) {
@@ -547,10 +578,96 @@
       XLSX.utils.book_append_sheet(wb, ws2, 'Unrecognized Scans');
     }
 
+    XLSX.writeFile(wb, exportFilename());
+    toast('Full report exported', 'ok');
+  }
+
+  function exportDiscrepanciesExcel() {
+    var rows = buildReportRows();
+    var totals = reportTotals(rows);
+    var discrepancies = rows.filter(function (r) { return r.diff !== 0; })
+      .sort(function (a, b) { return a.costImpact - b.costImpact; });
+
+    if (!discrepancies.length) {
+      toast('No discrepancies to export — everything counted matched.', 'ok');
+      return;
+    }
+
+    var aoa = [];
+    aoa.push(['Cycle Count — Discrepancies Only (for manual adjustment)']);
+    aoa.push(['Location', state.selectedLocation]);
+    aoa.push(['Started', state.startedAt]);
+    aoa.push(['Finished', state.finishedAt]);
+    aoa.push([]);
+    aoa.push(['Variants with discrepancies', totals.discrepancyCount]);
+    aoa.push(['Net unit difference', totals.netUnitDiff]);
+    aoa.push(['Total overage ($)', totals.overageDollars]);
+    aoa.push(['Total shortage ($)', -totals.shortageDollars]);
+    aoa.push(['Net dollar variance', totals.netDollars]);
+    aoa.push([]);
+    aoa.push(REPORT_ROW_HEADER);
+    discrepancies.forEach(function (r) { aoa.push(reportRowToAoa(r)); });
+
+    var wb = XLSX.utils.book_new();
+    var ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = REPORT_COL_WIDTHS;
+    XLSX.utils.book_append_sheet(wb, ws, 'Discrepancies');
+
+    XLSX.writeFile(wb, exportFilename('DISCREPANCIES ONLY'));
+    toast('Discrepancies-only file exported', 'ok');
+  }
+
+  function downloadCsv(filename, aoa) {
+    var csv = Papa.unparse(aoa);
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  var SHOPIFY_INVENTORY_HEADER = ['Handle', 'Title', 'Option1 Name', 'Option1 Value', 'Option2 Name', 'Option2 Value',
+    'Option3 Name', 'Option3 Value', 'SKU', 'HS Code', 'COO', 'Location', 'Bin name',
+    'Incoming (not editable)', 'Unavailable (not editable)', 'Committed (not editable)', 'Available (not editable)',
+    'On hand (current)', 'On hand (new)'];
+
+  // Matches Shopify's own "inventory bin / new on-hand" import template exactly,
+  // so it can be re-uploaded through Shopify's inventory import as-is. Only
+  // includes variants that came from a real row in the uploaded Inventory CSV
+  // (i.e. state.countLines) — items found unexpectedly during scanning
+  // (state.extraLines) have no such row for this location and are left out,
+  // since Shopify would need that SKU connected to this location first.
+  function exportShopifyInventoryImport() {
+    var lines = Object.values(state.countLines).filter(function (l) { return l.sourceRow; });
+    if (!lines.length) {
+      toast('Nothing to export.', 'warn');
+      return;
+    }
+
+    var aoa = [SHOPIFY_INVENTORY_HEADER];
+    lines.forEach(function (l) {
+      var sr = l.sourceRow;
+      aoa.push([
+        sr.handle, sr.title, sr.option1Name, sr.option1Value, sr.option2Name, sr.option2Value, sr.option3Name, sr.option3Value,
+        l.sku, sr.hsCode, sr.coo, state.selectedLocation, sr.binName,
+        sr.incoming, sr.unavailable, sr.committed, sr.available,
+        l.expected, l.counted
+      ]);
+    });
+
+    var skippedExtra = Object.keys(state.extraLines).length;
+    if (skippedExtra) {
+      toast(skippedExtra + ' unexpected find(s) left out — not tracked at this location in Shopify yet, so they need to be added manually', 'warn');
+    }
+
     var dateStr = new Date().toISOString().slice(0, 10);
     var safeLoc = (state.selectedLocation || 'location').replace(/[^a-z0-9]+/gi, '-');
-    XLSX.writeFile(wb, 'Cycle Count - ' + safeLoc + ' - ' + dateStr + '.xlsx');
-    toast('Report exported', 'ok');
+    downloadCsv('Cycle Count IMPORTABLE INVENTORY CHANGES - ' + safeLoc + ' - ' + dateStr + '.csv', aoa);
+    toast('Importable inventory changes file exported', 'ok');
   }
 
   // ---------------------------------------------------------------------
@@ -956,7 +1073,13 @@
     html += statHtml(totals.matchCount, 'Variants matching');
     html += '</div>';
 
-    html += '<div style="text-align:center; margin: 16px 0;"><button id="btn-export" class="primary">Export report (.xlsx)</button> <button id="btn-new-count">Start a new count</button></div>';
+    html += '<div style="text-align:center; margin: 16px 0;">' +
+      '<button id="btn-export" class="primary">Export full report (.xlsx)</button> ' +
+      '<button id="btn-export-discrepancies">Export discrepancies only (.xlsx)</button> ' +
+      '<button id="btn-export-shopify">Export importable inventory changes (.csv)</button> ' +
+      '<button id="btn-new-count">Start a new count</button>' +
+      '</div>' +
+      '<p class="muted" style="text-align:center; margin-top:-8px;">Full report: every counted variant, for your records. Discrepancies only: just the variants that need adjusting — hand this to your inventory manager. Importable inventory changes: same layout as your Inventory export, with "On hand (new)" filled in from this count, ready to re-upload to Shopify.</p>';
 
     html += '<div class="section-title">Discrepancies (' + discrepancies.length + ')</div>';
     html += reportTable(discrepancies, true);
@@ -975,6 +1098,8 @@
 
     root.innerHTML = html;
     document.getElementById('btn-export').onclick = exportExcel;
+    document.getElementById('btn-export-discrepancies').onclick = exportDiscrepanciesExcel;
+    document.getElementById('btn-export-shopify').onclick = exportShopifyInventoryImport;
     document.getElementById('btn-new-count').onclick = function () {
       showConfirm('Start a brand new count? This clears the current session (export your report first if you need it).', {
         okLabel: 'Start new count', danger: true, onConfirm: resetAll
