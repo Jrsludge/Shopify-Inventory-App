@@ -347,18 +347,19 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       screen: 'start', // start | location | summary | counting | report
       productsFileName: null,
       inventoryFileName: null,
-      products: [],          // [{sku, barcode, title, variantLabel, costPerItem}]
-      productBySku: {},       // sku -> product record
-      barcodeToSku: {},       // barcode -> sku (single owner)
-      barcodeConflicts: {},   // barcode -> [sku,...]  (2+ owners)
-      duplicateSkuWarnings: [], // skus that appeared more than once in Products CSV
-      inventoryByLocation: {}, // location -> { sku -> {onHand:number|null, notStocked:bool} }
+      products: [],          // [{sku, barcode, title, variantLabel, costPerItem, key}]
+      productByKey: {},      // "sku||variant" -> product record (the precise lookup)
+      barcodeToRecord: {},   // barcode -> product record (single owner)
+      barcodeConflicts: {},  // barcode -> [record,...]  (2+ distinct variants sharing a barcode)
+      sharedSkus: [],        // [{sku, variantLabels}] - same SKU legitimately used by >1 variant (e.g. King/Cal King)
+      duplicateRowWarnings: [], // [{sku, variantLabel}] - exact same SKU+variant repeated, likely an export glitch
+      inventoryByLocation: {}, // location -> { "sku||variant" -> {sku, variantLabel, onHand, notStocked, sourceRow} }
       locations: [],
       skusMissingFromProducts: [], // unique skus seen in inventory but not in products (global, informational)
       selectedLocation: null,
-      countLines: {},   // sku -> {sku, barcode, title, variantLabel, costPerItem, expected, counted, noBarcode, notInProducts, lastUpdated}
-      extraLines: {},   // sku -> same shape, expected forced to 0, foundUnexpected:true
-      scanLog: [],      // {t, input, result, sku}
+      countLines: {},   // "sku||variant" -> {sku, barcode, title, variantLabel, costPerItem, expected, counted, noBarcode, notInProducts, lastUpdated, key}
+      extraLines: {},   // "sku||variant" -> same shape, expected forced to 0, foundUnexpected:true
+      scanLog: [],      // {t, input, result, key}
       unrecognizedScans: {}, // rawValue -> count
       startedAt: null,
       finishedAt: null,
@@ -507,14 +508,30 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     return k === '__proto__' || k === 'constructor' || k === 'prototype';
   }
 
+  function joinVariantLabel(v1, v2, v3) {
+    return [v1, v2, v3].filter(Boolean).join(' / ');
+  }
+
+  // Some suppliers only distinguish e.g. King vs Cal King by physical
+  // barcode, not by SKU, so two genuinely different variants can share one
+  // SKU string in Shopify. Every count line is therefore identified by
+  // SKU + variant (not SKU alone), so those variants get separate expected
+  // quantities, separate tallies, and don't clobber each other. The variant
+  // portion is normalized (trim/lowercase) since it's compared across two
+  // different Shopify export types that may format it slightly differently.
+  function lineKey(sku, variantLabel) {
+    return sku + '||' + (variantLabel || '').toLowerCase().trim();
+  }
+
   function processProductsRows(rows) {
     var products = [];
-    var productBySku = {};
-    var barcodeToSku = {};
+    var productByKey = {};
+    var barcodeToRecord = {};
     var barcodeConflicts = {};
-    var duplicateSkuWarnings = [];
     var handleTitle = {};
-    var seenSku = {};
+    var seenKeys = {};
+    var duplicateRowWarnings = []; // exact same SKU+variant repeated - likely an export glitch
+    var skuVariantLabels = {}; // sku -> distinct variant labels seen, to spot shared-SKU variants
 
     // forward-fill Title per Handle (Shopify export leaves Title blank on
     // every row after the first for a given product)
@@ -529,46 +546,51 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (!sku || isUnsafeKey(sku)) return; // image-only, malformed, or unsafe rows
       var handle = getVal(row, 'Handle');
       var title = getVal(row, 'Title') || handleTitle[handle] || handle || '(untitled product)';
-      var opt1 = getVal(row, 'Option1 Value');
-      var opt2 = getVal(row, 'Option2 Value');
-      var opt3 = getVal(row, 'Option3 Value');
-      var variantLabel = [opt1, opt2, opt3].filter(Boolean).join(' / ');
+      var variantLabel = joinVariantLabel(getVal(row, 'Option1 Value'), getVal(row, 'Option2 Value'), getVal(row, 'Option3 Value'));
       var barcode = getVal(row, 'Variant Barcode');
       var cost = parseCost(row['Cost per item']);
+      var key = lineKey(sku, variantLabel);
 
-      if (seenSku[sku]) {
-        duplicateSkuWarnings.push(sku);
-      }
-      seenSku[sku] = true;
+      if (seenKeys[key]) duplicateRowWarnings.push({ sku: sku, variantLabel: variantLabel });
+      seenKeys[key] = true;
+
+      if (!skuVariantLabels[sku]) skuVariantLabels[sku] = [];
+      if (skuVariantLabels[sku].indexOf(variantLabel) === -1) skuVariantLabels[sku].push(variantLabel);
 
       var record = {
         sku: sku,
         barcode: barcode,
         title: title,
         variantLabel: variantLabel,
-        costPerItem: cost
+        costPerItem: cost,
+        key: key
       };
       products.push(record);
-      productBySku[sku] = record; // last one wins if duplicate SKU rows exist
+      productByKey[key] = record;
 
       if (barcode && !isUnsafeKey(barcode)) {
         if (barcodeConflicts[barcode]) {
-          barcodeConflicts[barcode].push(sku);
-        } else if (barcodeToSku[barcode] && barcodeToSku[barcode] !== sku) {
-          barcodeConflicts[barcode] = [barcodeToSku[barcode], sku];
-          delete barcodeToSku[barcode];
+          if (barcodeConflicts[barcode].every(function (r) { return r.key !== key; })) barcodeConflicts[barcode].push(record);
+        } else if (barcodeToRecord[barcode] && barcodeToRecord[barcode].key !== key) {
+          barcodeConflicts[barcode] = [barcodeToRecord[barcode], record];
+          delete barcodeToRecord[barcode];
         } else {
-          barcodeToSku[barcode] = sku;
+          barcodeToRecord[barcode] = record;
         }
       }
     });
 
+    var sharedSkus = Object.keys(skuVariantLabels)
+      .filter(function (sku) { return skuVariantLabels[sku].length > 1; })
+      .map(function (sku) { return { sku: sku, variantLabels: skuVariantLabels[sku] }; });
+
     return {
       products: products,
-      productBySku: productBySku,
-      barcodeToSku: barcodeToSku,
+      productByKey: productByKey,
+      barcodeToRecord: barcodeToRecord,
       barcodeConflicts: barcodeConflicts,
-      duplicateSkuWarnings: Array.from(new Set(duplicateSkuWarnings))
+      sharedSkus: sharedSkus,
+      duplicateRowWarnings: duplicateRowWarnings
     };
   }
 
@@ -588,10 +610,19 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       var onHand = notStocked ? null : parseFloat(raw.replace(/[^0-9.\-]/g, ''));
       if (isNaN(onHand)) { onHand = null; notStocked = true; }
 
+      // Keyed by SKU + variant, not bare SKU: two rows sharing one SKU (e.g.
+      // King and Cal King, when a supplier only distinguishes them by
+      // barcode) must stay as two separate lines, or one's on-hand quantity
+      // silently overwrites the other's instead of being tracked alongside it.
+      var variantLabel = joinVariantLabel(getVal(row, 'Option1 Value'), getVal(row, 'Option2 Value'), getVal(row, 'Option3 Value'));
+      var key = lineKey(sku, variantLabel);
+
       // Keep the original row's own fields so a Shopify-importable inventory
       // file can be regenerated later as a faithful echo of this file, with
       // only "On hand (new)" filled in from the physical count.
-      inventoryByLocation[location][sku] = {
+      inventoryByLocation[location][key] = {
+        sku: sku,
+        variantLabel: variantLabel,
         onHand: onHand,
         notStocked: notStocked,
         sourceRow: {
@@ -624,8 +655,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var missing = {};
     Object.keys(state.inventoryByLocation).forEach(function (loc) {
       var m = state.inventoryByLocation[loc];
-      Object.keys(m).forEach(function (sku) {
-        if (!m[sku].notStocked && !state.productBySku[sku]) missing[sku] = true;
+      Object.keys(m).forEach(function (key) {
+        if (!m[key].notStocked && !state.productByKey[key]) missing[m[key].sku] = true;
       });
     });
     return Object.keys(missing).sort();
@@ -639,10 +670,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (err) { toast('Could not read Products CSV: ' + err.message, 'bad'); return; }
       var result = processProductsRows(rows);
       state.products = result.products;
-      state.productBySku = result.productBySku;
-      state.barcodeToSku = result.barcodeToSku;
+      state.productByKey = result.productByKey;
+      state.barcodeToRecord = result.barcodeToRecord;
       state.barcodeConflicts = result.barcodeConflicts;
-      state.duplicateSkuWarnings = result.duplicateSkuWarnings;
+      state.sharedSkus = result.sharedSkus;
+      state.duplicateRowWarnings = result.duplicateRowWarnings;
       state.productsFileName = file.name;
       state.skusMissingFromProducts = computeMissingFromProducts();
       saveState();
@@ -671,21 +703,25 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var expected = state.inventoryByLocation[location] || {};
     var countLines = {};
 
-    Object.keys(expected).forEach(function (sku) {
-      var entry = expected[sku];
+    Object.keys(expected).forEach(function (key) {
+      var entry = expected[key];
       if (entry.notStocked) return; // not carried at this location at all
-      var product = state.productBySku[sku];
-      countLines[sku] = {
-        sku: sku,
+      var product = state.productByKey[key];
+      // Fall back to the Inventory file's own title/variant (not just a
+      // generic placeholder) when this SKU+variant has no Products match.
+      var fallbackTitle = entry.sourceRow.title || entry.sourceRow.handle || '(unknown product)';
+      countLines[key] = {
+        sku: entry.sku,
         barcode: product ? product.barcode : '',
-        title: product ? product.title : '(unknown product)',
-        variantLabel: product ? product.variantLabel : '',
+        title: product ? product.title : fallbackTitle,
+        variantLabel: product ? product.variantLabel : entry.variantLabel,
         costPerItem: product ? product.costPerItem : null,
         expected: entry.onHand || 0,
         counted: 0,
         noBarcode: !product || !product.barcode,
         notInProducts: !product,
         lastUpdated: 0,
+        key: key,
         sourceRow: entry.sourceRow
       };
     });
@@ -704,12 +740,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   // ---------------------------------------------------------------------
   // Scanning
   // ---------------------------------------------------------------------
-  function bumpLine(lines, sku, delta) {
-    var line = lines[sku];
+  function bumpLine(lines, key, delta) {
+    var line = lines[key];
     if (!line) return false;
     line.counted = Math.max(0, line.counted + delta);
     line.lastUpdated = ++state.seq;
     return true;
+  }
+
+  function describeRecord(r) {
+    return r.sku + (r.variantLabel ? ' (' + r.variantLabel + ')' : '');
   }
 
   function processScan(rawValue) {
@@ -719,18 +759,18 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       toast('Ignored invalid scan value: ' + val, 'bad');
       return;
     }
-    var entry = { t: nowStr(), input: val, result: '', sku: null };
+    var entry = { t: nowStr(), input: val, result: '', key: null };
 
     if (state.barcodeConflicts[val]) {
       entry.result = 'conflict';
       state.scanLog.push(entry);
-      toast('Barcode ' + val + ' matches multiple SKUs (' + state.barcodeConflicts[val].join(', ') + '). Use manual search below to pick the right one.', 'bad');
+      toast('Barcode ' + val + ' matches multiple variants (' + state.barcodeConflicts[val].map(describeRecord).join(', ') + '). Use manual search below to pick the right one.', 'bad');
       saveState();
       return;
     }
 
-    var sku = state.barcodeToSku[val];
-    if (!sku) {
+    var record = state.barcodeToRecord[val];
+    if (!record) {
       state.unrecognizedScans[val] = (state.unrecognizedScans[val] || 0) + 1;
       entry.result = 'unknown';
       state.scanLog.push(entry);
@@ -741,16 +781,17 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return;
     }
 
-    entry.sku = sku;
-    if (state.countLines[sku]) {
-      bumpLine(state.countLines, sku, 1);
+    var key = record.key;
+    entry.key = key;
+    if (state.countLines[key]) {
+      bumpLine(state.countLines, key, 1);
       entry.result = 'ok';
-      var line = state.countLines[sku];
+      var line = state.countLines[key];
       toast((line.title + (line.variantLabel ? ' — ' + line.variantLabel : '')) + '  +1  (now ' + line.counted + ')', 'ok');
     } else {
-      addOrBumpExtra(sku);
+      addOrBumpExtra(key, record);
       entry.result = 'extra';
-      var el = state.extraLines[sku];
+      var el = state.extraLines[key];
       toast('Not expected at this location! ' + el.title + '  +1  (now ' + el.counted + ') — will show as overage', 'warn');
     }
     state.scanLog.push(entry);
@@ -759,11 +800,10 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     renderCountingLists();
   }
 
-  function addOrBumpExtra(sku) {
-    if (!state.extraLines[sku]) {
-      var product = state.productBySku[sku];
-      state.extraLines[sku] = {
-        sku: sku,
+  function addOrBumpExtra(key, product) {
+    if (!state.extraLines[key]) {
+      state.extraLines[key] = {
+        sku: product ? product.sku : key,
         barcode: product ? product.barcode : '',
         title: product ? product.title : '(unknown product)',
         variantLabel: product ? product.variantLabel : '',
@@ -773,15 +813,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         noBarcode: !product || !product.barcode,
         notInProducts: !product,
         foundUnexpected: true,
-        lastUpdated: 0
+        lastUpdated: 0,
+        key: key
       };
     }
-    bumpLine(state.extraLines, sku, 1);
+    bumpLine(state.extraLines, key, 1);
   }
 
-  function manualAdjust(sku, delta, isExtra) {
+  function manualAdjust(key, delta, isExtra) {
     var lines = isExtra ? state.extraLines : state.countLines;
-    bumpLine(lines, sku, delta);
+    bumpLine(lines, key, delta);
     saveState();
     renderCountingStatsTabs();
     renderCountingLists();
@@ -791,9 +832,9 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var entry = state.scanLog.pop();
     if (!entry) { toast('Nothing to undo', 'warn'); return; }
     if (entry.result === 'ok') {
-      bumpLine(state.countLines, entry.sku, -1);
+      bumpLine(state.countLines, entry.key, -1);
     } else if (entry.result === 'extra') {
-      bumpLine(state.extraLines, entry.sku, -1);
+      bumpLine(state.extraLines, entry.key, -1);
     } else if (entry.result === 'unknown') {
       if (state.unrecognizedScans[entry.input] > 1) state.unrecognizedScans[entry.input]--;
       else delete state.unrecognizedScans[entry.input];
@@ -950,7 +991,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   }
 
   function downloadCsv(filename, aoa) {
-    var csv = Papa.unparse(aoa);
+    // Trailing CRLF so the final row is newline-terminated, matching Shopify's
+    // own export format. UTF-8, and deliberately NO byte-order mark: a BOM
+    // would prepend bytes to the "Handle" header and break Shopify's exact
+    // header-name matching on import.
+    var csv = Papa.unparse(aoa) + '\r\n';
     var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
@@ -980,26 +1025,43 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return;
     }
 
-    var aoa = [SHOPIFY_INVENTORY_HEADER];
-    lines.forEach(function (l) {
-      var sr = l.sourceRow;
-      aoa.push([
-        sr.handle, sr.title, sr.option1Name, sr.option1Value, sr.option2Name, sr.option2Value, sr.option3Name, sr.option3Value,
-        l.sku, sr.hsCode, sr.coo, state.selectedLocation, sr.binName,
-        sr.incoming, sr.unavailable, sr.committed, sr.available,
-        l.expected, l.counted
-      ]);
-    });
+    function doExport() {
+      var aoa = [SHOPIFY_INVENTORY_HEADER];
+      lines.forEach(function (l) {
+        var sr = l.sourceRow;
+        aoa.push([
+          sr.handle, sr.title, sr.option1Name, sr.option1Value, sr.option2Name, sr.option2Value, sr.option3Name, sr.option3Value,
+          l.sku, sr.hsCode, sr.coo, state.selectedLocation, sr.binName,
+          sr.incoming, sr.unavailable, sr.committed, sr.available,
+          l.expected, l.counted
+        ]);
+      });
 
-    var skippedExtra = Object.keys(state.extraLines).length;
-    if (skippedExtra) {
-      toast(skippedExtra + ' unexpected find(s) left out — not tracked at this location in Shopify yet, so they need to be added manually', 'warn');
+      var skippedExtra = Object.keys(state.extraLines).length;
+      if (skippedExtra) {
+        toast(skippedExtra + ' unexpected find(s) left out — not tracked at this location in Shopify yet, so they need to be added manually', 'warn');
+      }
+
+      var dateStr = new Date().toISOString().slice(0, 10);
+      var safeLoc = (state.selectedLocation || 'location').replace(/[^a-z0-9]+/gi, '-');
+      downloadCsv('Cycle Count IMPORTABLE INVENTORY CHANGES - ' + safeLoc + ' - ' + dateStr + '.csv', aoa);
+      toast('Importable inventory changes file exported', 'ok');
     }
 
-    var dateStr = new Date().toISOString().slice(0, 10);
-    var safeLoc = (state.selectedLocation || 'location').replace(/[^a-z0-9]+/gi, '-');
-    downloadCsv('Cycle Count IMPORTABLE INVENTORY CHANGES - ' + safeLoc + ' - ' + dateStr + '.csv', aoa);
-    toast('Importable inventory changes file exported', 'ok');
+    // This file SETS on-hand quantities in Shopify. Any expected variant that
+    // was never scanned exports as 0, so re-importing zeroes it out. That is
+    // correct for a complete location count but destructive for a partial one,
+    // so confirm the impact whenever there are items that would be zeroed.
+    var zeroCount = lines.filter(function (l) { return l.counted === 0; }).length;
+    if (zeroCount > 0) {
+      showConfirm(
+        'This file will set on-hand quantities at "' + state.selectedLocation + '" for ' + lines.length + ' variant(s) in Shopify. ' +
+        zeroCount + ' of them were not scanned and will be set to 0 — only correct if this was a complete count of the whole location. Export the file?',
+        { okLabel: 'Export file', onConfirm: doExport }
+      );
+    } else {
+      doExport();
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1146,7 +1208,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var noBarcodeCount = lines.filter(function (l) { return l.noBarcode && !l.notInProducts; }).length;
     var notInProductsCount = lines.filter(function (l) { return l.notInProducts; }).length;
     var conflictCount = Object.keys(state.barcodeConflicts).length;
-    var dupSkuCount = state.duplicateSkuWarnings.length;
+    var dupRowCount = state.duplicateRowWarnings.length;
+    var sharedSkuCount = state.sharedSkus.length;
 
     var html = '';
     html += '<h1>Ready to count: ' + esc(state.selectedLocation) + '</h1>';
@@ -1158,25 +1221,34 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     html += statHtml(conflictCount, 'Duplicate barcodes');
     html += '</div>';
 
-    if (noBarcodeCount || notInProductsCount || conflictCount || dupSkuCount) {
+    if (noBarcodeCount || notInProductsCount || conflictCount || dupRowCount) {
       html += '<div class="banner warn">Some data issues were found — items below will still be trackable via manual search during counting, but double-check them.</div>';
     } else {
       html += '<div class="banner info">No data issues found. You\'re good to start scanning.</div>';
     }
 
     if (conflictCount) {
-      html += '<div class="panel"><strong>Duplicate barcodes</strong> (same barcode used by more than one SKU — scans of these will require manual disambiguation):<ul>';
+      html += '<div class="panel"><strong>Duplicate barcodes</strong> (same barcode used by more than one distinct variant — scans of these will require manual disambiguation):<ul>';
       Object.keys(state.barcodeConflicts).forEach(function (bc) {
-        html += '<li>' + esc(bc) + ' &rarr; ' + state.barcodeConflicts[bc].map(esc).join(', ') + '</li>';
+        html += '<li>' + esc(bc) + ' &rarr; ' + state.barcodeConflicts[bc].map(function (r) { return esc(describeRecord(r)); }).join(', ') + '</li>';
       });
       html += '</ul></div>';
     }
-    if (dupSkuCount) {
-      html += '<div class="panel"><strong>Duplicate SKUs in Products file:</strong> ' + state.duplicateSkuWarnings.map(esc).join(', ') + '</div>';
+    if (dupRowCount) {
+      html += '<div class="panel"><strong>Repeated rows in Products file</strong> (exact same SKU + variant appears more than once — likely a duplicate export line):<br>' +
+        state.duplicateRowWarnings.map(function (d) { return esc(describeRecord(d)); }).join(', ') + '</div>';
+    }
+    if (sharedSkuCount) {
+      html += '<div class="panel"><strong>SKUs shared across more than one variant</strong> (e.g. King/Cal King using one supplier SKU) — each variant is tracked as its own line using its own barcode, so this is informational only:<ul>';
+      state.sharedSkus.forEach(function (s) {
+        html += '<li>' + esc(s.sku) + ' &rarr; ' + s.variantLabels.map(esc).join(', ') + '</li>';
+      });
+      html += '</ul></div>';
     }
     if (notInProductsCount) {
-      var missingSkus = lines.filter(function (l) { return l.notInProducts; }).map(function (l) { return l.sku; });
-      html += '<div class="panel"><strong>SKUs expected at this location but missing from the Products file</strong> (no barcode available — must be counted manually by SKU):<br>' + missingSkus.map(esc).join(', ') + '</div>';
+      var missingLines = lines.filter(function (l) { return l.notInProducts; });
+      html += '<div class="panel"><strong>SKUs expected at this location but missing from the Products file</strong> (no barcode available — must be counted manually by SKU):<br>' +
+        missingLines.map(function (l) { return esc(describeRecord(l)); }).join(', ') + '</div>';
     }
 
     html += '<div style="text-align:center; margin-top:20px;">';
@@ -1362,8 +1434,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
           '<td class="num">' + fmtNum(l.expected) + '</td>' +
           '<td class="num">' + fmtNum(l.counted) + '</td>' +
           '<td><div class="qty-controls">' +
-          '<button class="iconbtn adj-btn" data-sku="' + esc(l.sku) + '" data-extra="' + (isExtraTab ? '1' : '0') + '" data-delta="-1">&minus;</button>' +
-          '<button class="iconbtn adj-btn" data-sku="' + esc(l.sku) + '" data-extra="' + (isExtraTab ? '1' : '0') + '" data-delta="1">+</button>' +
+          '<button class="iconbtn adj-btn" data-key="' + esc(l.key) + '" data-extra="' + (isExtraTab ? '1' : '0') + '" data-delta="-1">&minus;</button>' +
+          '<button class="iconbtn adj-btn" data-key="' + esc(l.key) + '" data-extra="' + (isExtraTab ? '1' : '0') + '" data-delta="1">+</button>' +
           '</div></td>' +
           '</tr>';
       });
@@ -1374,7 +1446,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 
     wrap.querySelectorAll('.adj-btn').forEach(function (btn) {
       btn.onclick = function () {
-        manualAdjust(btn.getAttribute('data-sku'), parseInt(btn.getAttribute('data-delta'), 10), btn.getAttribute('data-extra') === '1');
+        manualAdjust(btn.getAttribute('data-key'), parseInt(btn.getAttribute('data-delta'), 10), btn.getAttribute('data-extra') === '1');
       };
     });
   }
