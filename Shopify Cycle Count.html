@@ -360,7 +360,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       countLines: {},   // "sku||variant" -> {sku, barcode, title, variantLabel, costPerItem, expected, counted, noBarcode, notInProducts, lastUpdated, key}
       extraLines: {},   // "sku||variant" -> same shape, expected forced to 0, foundUnexpected:true
       skuToCountKeys: {}, // sku -> [countLine key, ...] so a scanned barcode resolves to its expected line(s) by SKU
-      scanLog: [],      // {t, input, result, key}
+      scanLog: [],      // {t, input, result, key} — drives Undo (scans only)
+      activityLog: [],  // {t, kind, key, delta, count, raw} — chronological audit of every scan & manual adjust
       unrecognizedScans: {}, // rawValue -> count
       startedAt: null,
       finishedAt: null,
@@ -371,13 +372,25 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   var state = loadState() || freshState();
   var resumeBannerDismissed = false;
 
+  // These parse-time structures are large (the full inventory across every
+  // location can be ~10 MB on a real catalog) and are only ever used BEFORE a
+  // count begins (location picker + building count lines). Persisting them
+  // would blow the browser's ~5 MB localStorage quota — saves would silently
+  // fail and resume would break — and would make every scan re-serialize
+  // megabytes. So they're excluded from the saved session; an in-progress or
+  // finished count restores fully from the remaining (small) state.
+  var PERSIST_OMIT = { inventoryByLocation: 1, products: 1, productsBySku: 1 };
+  var quotaWarned = false;
+
   function loadState() {
     try {
       var raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return null;
       var parsed = JSON.parse(raw);
       if (!parsed || !parsed.screen) return null;
-      return parsed;
+      // Merge over fresh defaults so omitted (un-persisted) structures come
+      // back as empty objects rather than undefined.
+      return Object.assign(freshState(), parsed);
     } catch (e) {
       return null;
     }
@@ -385,9 +398,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 
   function saveState() {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      var toSave = {};
+      Object.keys(state).forEach(function (k) { if (!PERSIST_OMIT[k]) toSave[k] = state[k]; });
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+      quotaWarned = false;
     } catch (e) {
       console.error('Could not save session', e);
+      if (!quotaWarned) {
+        quotaWarned = true;
+        toast('Warning: this count is too large to auto-save for crash recovery. It will still work, but export before closing the tab.', 'bad');
+      }
     }
   }
 
@@ -424,6 +444,13 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   function fmtNum(n) {
     if (n === null || n === undefined || isNaN(n)) return '—';
     return String(n);
+  }
+
+  // Round money to whole cents so stored/exported dollar figures are exact
+  // (no floating-point tails like -187731.14000000007 that could confuse an
+  // accountant summing the column). The +EPSILON avoids 0.5-cent edge drift.
+  function round2(n) {
+    return Math.round((n + Number.EPSILON) * 100) / 100;
   }
 
   function parseCost(raw) {
@@ -723,6 +750,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   // Location selection -> build count lines
   // ---------------------------------------------------------------------
   function selectLocation(location) {
+    // The full inventory isn't persisted (see PERSIST_OMIT), so after a reload
+    // on the pre-count screens there's nothing to build from — send the user
+    // back to re-upload rather than building an empty count.
+    if (!state.inventoryByLocation || !state.inventoryByLocation[location]) {
+      toast('Please re-upload your Products and Inventory CSVs to start a count here.', 'warn');
+      state.screen = 'start';
+      saveState();
+      render();
+      return;
+    }
     state.selectedLocation = location;
     var expected = state.inventoryByLocation[location] || {};
     var countLines = {};
@@ -760,10 +797,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     state.skuToCountKeys = skuToCountKeys;
     state.extraLines = {};
     state.scanLog = [];
+    state.activityLog = [];
     state.unrecognizedScans = {};
     state.startedAt = nowStr();
     state.finishedAt = null;
     state.screen = 'summary';
+    // Reset the counting-screen view state for the new count so a tab that
+    // only exists for some locations (e.g. "No barcode") can't stay selected
+    // and show an empty, tab-less list at the next location.
+    countingTab = 'all';
+    countingSearch = '';
     saveState();
     render();
   }
@@ -783,6 +826,25 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     return r.sku + (r.variantLabel ? ' (' + r.variantLabel + ')' : '');
   }
 
+  // Append-only audit of every scan and manual adjustment, shown in the
+  // Activity log tab. Bounded so a very large count can't blow the storage
+  // quota (which would silently break save/resume).
+  var ACTIVITY_CAP = 5000;
+  function logActivity(kind, opts) {
+    opts = opts || {};
+    state.activityLog.push({
+      t: nowStr(),
+      kind: kind, // 'match' | 'extra' | 'manual' | 'unknown' | 'conflict' | 'undo'
+      key: opts.key || null,
+      delta: opts.delta || 0,
+      count: (opts.count === undefined ? null : opts.count),
+      raw: opts.raw || null
+    });
+    if (state.activityLog.length > ACTIVITY_CAP) {
+      state.activityLog.splice(0, state.activityLog.length - ACTIVITY_CAP);
+    }
+  }
+
   function processScan(rawValue) {
     var val = rawValue.trim();
     if (!val) return;
@@ -795,8 +857,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     if (state.barcodeConflicts[val]) {
       entry.result = 'conflict';
       state.scanLog.push(entry);
+      logActivity('conflict', { raw: val });
       toast('Barcode ' + val + ' matches multiple variants (' + state.barcodeConflicts[val].map(describeRecord).join(', ') + '). Use manual search below to pick the right one.', 'bad');
       saveState();
+      renderCountingStatsTabs();
+      renderCountingLists();
       return;
     }
 
@@ -805,6 +870,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       state.unrecognizedScans[val] = (state.unrecognizedScans[val] || 0) + 1;
       entry.result = 'unknown';
       state.scanLog.push(entry);
+      logActivity('unknown', { raw: val });
       toast('Unknown barcode: ' + val, 'bad');
       saveState();
       renderCountingStatsTabs();
@@ -834,6 +900,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       entry.key = key;
       entry.result = 'ok';
       var line = state.countLines[key];
+      logActivity('match', { key: key, delta: 1, count: line.counted });
       toast((line.title + (line.variantLabel ? ' — ' + line.variantLabel : '')) + '  +1  (now ' + line.counted + ')', 'ok');
     } else {
       var extraKey = lineKey(record.sku, record.variantLabel);
@@ -841,6 +908,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       entry.key = extraKey;
       entry.result = 'extra';
       var el = state.extraLines[extraKey];
+      logActivity('extra', { key: extraKey, delta: 1, count: el.counted });
       toast('Not expected at this location! ' + el.title + '  +1  (now ' + el.counted + ') — will show as overage', 'warn');
     }
     state.scanLog.push(entry);
@@ -871,7 +939,9 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 
   function manualAdjust(key, delta, isExtra) {
     var lines = isExtra ? state.extraLines : state.countLines;
-    bumpLine(lines, key, delta);
+    if (bumpLine(lines, key, delta)) {
+      logActivity('manual', { key: key, delta: delta, count: lines[key].counted });
+    }
     saveState();
     renderCountingStatsTabs();
     renderCountingLists();
@@ -880,14 +950,18 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   function undoLastScan() {
     var entry = state.scanLog.pop();
     if (!entry) { toast('Nothing to undo', 'warn'); return; }
+    var count = null;
     if (entry.result === 'ok') {
       bumpLine(state.countLines, entry.key, -1);
+      count = state.countLines[entry.key] ? state.countLines[entry.key].counted : null;
     } else if (entry.result === 'extra') {
       bumpLine(state.extraLines, entry.key, -1);
+      count = state.extraLines[entry.key] ? state.extraLines[entry.key].counted : null;
     } else if (entry.result === 'unknown') {
       if (state.unrecognizedScans[entry.input] > 1) state.unrecognizedScans[entry.input]--;
       else delete state.unrecognizedScans[entry.input];
     }
+    logActivity('undo', { key: entry.key, count: count, raw: entry.input });
     saveState();
     toast('Undid last scan: ' + entry.input, 'warn');
     renderCountingStatsTabs();
@@ -905,7 +979,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     all.forEach(function (l) {
       l.diff = l.counted - l.expected;
       var cost = l.costPerItem === null || l.costPerItem === undefined ? 0 : l.costPerItem;
-      l.costImpact = l.diff * cost;
+      l.costImpact = round2(l.diff * cost);
     });
 
     return all;
@@ -925,7 +999,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (r.costImpact < 0) t.shortageDollars += -r.costImpact;
       if (r.diff !== 0) t.discrepancyCount++; else t.matchCount++;
     });
-    t.netDollars = t.overageDollars - t.shortageDollars;
+    // Round the accumulated totals to cents so summing many rows can't leave a
+    // floating-point tail in the displayed or exported figures.
+    t.overageDollars = round2(t.overageDollars);
+    t.shortageDollars = round2(t.shortageDollars);
+    t.netDollars = round2(t.overageDollars - t.shortageDollars);
     return t;
   }
 
@@ -1226,6 +1304,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var html = '';
     html += '<h1>Which location are you counting?</h1>';
     html += stepper(1);
+    var hasInventory = state.inventoryByLocation && Object.keys(state.inventoryByLocation).length > 0;
+    if (!hasInventory) {
+      // Happens only after a reload landed here (the full inventory isn't
+      // persisted). The CSVs must be re-uploaded to pick a location.
+      html += '<div class="banner warn">Your uploaded files aren\'t loaded in memory anymore (the page was reloaded). Please re-upload your Products and Inventory CSVs to start a new count.</div>';
+      html += '<button id="btn-back-start" class="primary">&larr; Back to upload</button>';
+      root.innerHTML = html;
+      document.getElementById('btn-back-start').onclick = function () { state.screen = 'start'; saveState(); render(); };
+      return;
+    }
     if (!state.locations.length) {
       html += '<div class="banner bad">No locations found in the Inventory CSV. Please check the file and go back.</div>';
     } else {
@@ -1322,7 +1410,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     return '<div class="stat"><div class="value">' + value + '</div><div class="label">' + esc(label) + '</div></div>';
   }
 
-  var countingTab = 'notcounted';
+  var countingTab = 'all';
   var countingSearch = '';
 
   function renderCounting() {
@@ -1394,6 +1482,10 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     var extras = Object.values(state.extraLines);
     var countedLines = lines.filter(function (l) { return l.counted > 0; });
     var notCountedLines = lines.filter(function (l) { return l.counted === 0; });
+    // Items with no barcode can't be scanned — they must be counted manually,
+    // so give counters a dedicated tab to work through exactly those.
+    var noBarcodeLines = lines.filter(function (l) { return l.noBarcode; });
+    var noBarcodeUncounted = noBarcodeLines.filter(function (l) { return l.counted === 0; }).length;
     var unknownCount = Object.keys(state.unrecognizedScans).reduce(function (a, k) { return a + state.unrecognizedScans[k]; }, 0);
 
     var html = '';
@@ -1408,14 +1500,74 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     html += tabBtn('notcounted', 'Not yet counted (' + notCountedLines.length + ')');
     html += tabBtn('counted', 'Counted (' + countedLines.length + ')');
     html += tabBtn('all', 'All (' + lines.length + ')');
+    if (noBarcodeLines.length) {
+      html += tabBtn('nobarcode', 'No barcode — count manually (' + noBarcodeUncounted + ' left of ' + noBarcodeLines.length + ')');
+    }
     html += tabBtn('extra', 'Unexpected finds (' + extras.length + ')');
     html += tabBtn('unknown', 'Unrecognized (' + Object.keys(state.unrecognizedScans).length + ')');
+    html += tabBtn('activity', 'Activity log (' + state.activityLog.length + ')');
     html += '</div>';
 
     wrap.innerHTML = html;
     wrap.querySelectorAll('.tab-btn').forEach(function (btn) {
       btn.onclick = function () { countingTab = btn.getAttribute('data-tab'); renderCountingStatsTabs(); renderCountingLists(); };
     });
+  }
+
+  function activityLabelFor(e) {
+    if (e.key && state.countLines[e.key]) {
+      var l = state.countLines[e.key];
+      return esc(l.title) + (l.variantLabel ? ' — ' + esc(l.variantLabel) : '') + ' <span class="muted">(' + esc(l.sku) + ')</span>';
+    }
+    if (e.key && state.extraLines[e.key]) {
+      var x = state.extraLines[e.key];
+      return esc(x.title) + (x.variantLabel ? ' — ' + esc(x.variantLabel) : '') + ' <span class="muted">(' + esc(x.sku) + ', unexpected)</span>';
+    }
+    if (e.raw) return '<span class="muted">barcode ' + esc(e.raw) + '</span>';
+    return '<span class="muted">—</span>';
+  }
+
+  function activityActionFor(e) {
+    switch (e.kind) {
+      case 'match': return '<span style="color:var(--good)">Scan +1</span>';
+      case 'extra': return '<span style="color:var(--warn)">Scan +1 (unexpected)</span>';
+      case 'manual': return (e.delta >= 0 ? '<span style="color:var(--good)">Manual +' + e.delta + '</span>' : '<span style="color:var(--bad)">Manual ' + e.delta + '</span>');
+      case 'unknown': return '<span style="color:var(--bad)">Unrecognized scan</span>';
+      case 'conflict': return '<span style="color:var(--bad)">Ambiguous barcode</span>';
+      case 'undo': return '<span style="color:var(--muted)">Undo</span>';
+      default: return esc(e.kind);
+    }
+  }
+
+  function renderActivityLog() {
+    var log = state.activityLog;
+    if (!log.length) return '<p class="muted">No activity yet. Scans and manual +/- adjustments will be recorded here, newest first.</p>';
+
+    var q = countingSearch.trim().toLowerCase();
+    // Show newest first. Search filters by item title/SKU/variant or scanned value.
+    var entries = log.slice().reverse();
+    if (q) {
+      entries = entries.filter(function (e) {
+        var l = (e.key && (state.countLines[e.key] || state.extraLines[e.key])) || null;
+        var hay = (l ? (l.title + ' ' + (l.variantLabel || '') + ' ' + l.sku) : (e.raw || '')).toLowerCase();
+        return hay.indexOf(q) !== -1;
+      });
+    }
+
+    var maxRows = 500;
+    var shown = entries.slice(0, maxRows);
+    var html = '<table><thead><tr><th>Time</th><th>Action</th><th>Item</th><th class="num">New count</th></tr></thead><tbody>';
+    shown.forEach(function (e) {
+      html += '<tr>' +
+        '<td class="muted" style="white-space:nowrap;">' + esc((e.t || '').replace(/^.*,\s*/, '')) + '</td>' +
+        '<td style="white-space:nowrap;">' + activityActionFor(e) + '</td>' +
+        '<td>' + activityLabelFor(e) + '</td>' +
+        '<td class="num">' + (e.count === null || e.count === undefined ? '' : e.count) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    if (entries.length > maxRows) html += '<p class="muted">Showing the ' + maxRows + ' most recent of ' + entries.length + ' entries — use search to narrow down.</p>';
+    return html;
   }
 
   function renderCountingLists() {
@@ -1442,12 +1594,19 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return;
     }
 
+    if (countingTab === 'activity') {
+      wrap.innerHTML = renderActivityLog();
+      return;
+    }
+
     if (isExtraTab) {
       lines = Object.values(state.extraLines);
     } else if (countingTab === 'counted') {
       lines = Object.values(state.countLines).filter(function (l) { return l.counted > 0; });
     } else if (countingTab === 'notcounted') {
       lines = Object.values(state.countLines).filter(function (l) { return l.counted === 0; });
+    } else if (countingTab === 'nobarcode') {
+      lines = Object.values(state.countLines).filter(function (l) { return l.noBarcode; });
     } else {
       lines = Object.values(state.countLines);
     }
@@ -1461,9 +1620,13 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       });
     }
 
+    // Stable, count-independent order: items never move as they're counted,
+    // so the +/- buttons stay under the user's cursor (no accidental presses).
+    // Recent activity is tracked in the Activity log tab instead.
     lines = lines.slice().sort(function (a, b) {
-      if (b.lastUpdated !== a.lastUpdated) return b.lastUpdated - a.lastUpdated;
-      return a.title.localeCompare(b.title);
+      return a.title.localeCompare(b.title) ||
+        (a.variantLabel || '').localeCompare(b.variantLabel || '') ||
+        a.sku.localeCompare(b.sku);
     });
 
     var maxRows = 300;
